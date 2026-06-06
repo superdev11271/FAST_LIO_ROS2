@@ -1,9 +1,80 @@
 #include "preprocess.h"
 
 #include <pcl/common/common.h>
+#include <sensor_msgs/msg/point_field.hpp>
+
+#include <cmath>
+#include <limits>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
+
+namespace
+{
+struct LidarPointFieldOffsets
+{
+  int x = -1;
+  int y = -1;
+  int z = -1;
+  int intensity = -1;
+  int ring = -1;
+  int time = -1;
+  uint8_t time_datatype = 0;
+};
+
+LidarPointFieldOffsets get_lidar_field_offsets(const sensor_msgs::msg::PointCloud2& cloud)
+{
+  LidarPointFieldOffsets offsets;
+  for (const auto& field : cloud.fields)
+  {
+    if (field.name == "x")
+      offsets.x = field.offset;
+    else if (field.name == "y")
+      offsets.y = field.offset;
+    else if (field.name == "z")
+      offsets.z = field.offset;
+    else if (field.name == "intensity")
+      offsets.intensity = field.offset;
+    else if (field.name == "ring")
+      offsets.ring = field.offset;
+    else if (field.name == "timestamp" || field.name == "time")
+    {
+      offsets.time = field.offset;
+      offsets.time_datatype = field.datatype;
+    }
+  }
+  return offsets;
+}
+
+float read_lidar_point_time(const uint8_t* point_ptr, const LidarPointFieldOffsets& offsets)
+{
+  if (offsets.time < 0)
+    return 0.f;
+
+  if (offsets.time_datatype == sensor_msgs::msg::PointField::FLOAT64)
+    return static_cast<float>(*reinterpret_cast<const double*>(point_ptr + offsets.time));
+
+  return *reinterpret_cast<const float*>(point_ptr + offsets.time);
+}
+
+float read_lidar_float(const uint8_t* point_ptr, int offset)
+{
+  return *reinterpret_cast<const float*>(point_ptr + offset);
+}
+
+uint16_t read_lidar_ring(const uint8_t* point_ptr, int offset)
+{
+  return *reinterpret_cast<const uint16_t*>(point_ptr + offset);
+}
+
+bool is_lidar_point_valid(const uint8_t* point_ptr, const LidarPointFieldOffsets& offsets)
+{
+  const float x = read_lidar_float(point_ptr, offsets.x);
+  const float y = read_lidar_float(point_ptr, offsets.y);
+  const float z = read_lidar_float(point_ptr, offsets.z);
+  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+}  // namespace
 
 Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
 {
@@ -299,12 +370,19 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<velodyne_ros::Point> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+  const auto offsets = get_lidar_field_offsets(*msg);
+  if (offsets.x < 0 || offsets.y < 0 || offsets.z < 0 || offsets.ring < 0)
+    return;
+
+  const int plsize = static_cast<int>(msg->width * msg->height);
   if (plsize == 0)
     return;
   pl_surf.reserve(plsize);
+
+  const bool has_point_time = offsets.time >= 0;
+  const bool absolute_point_time =
+      has_point_time && offsets.time_datatype == sensor_msgs::msg::PointField::FLOAT64;
+  const double scan_time_base = absolute_point_time ? rclcpp::Time(msg->header.stamp).seconds() : 0.0;
 
   /*** These variables only works when no point timestamps given ***/
   double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
@@ -314,25 +392,70 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
   /*****************************************************************/
 
-  if (pl_orig.points[plsize - 1].time > 0)
+  const uint8_t* data_ptr = msg->data.data();
+  const int point_step = static_cast<int>(msg->point_step);
+
+  // RoboSense encodes per-point azimuth (0~2pi rad) in the float64 timestamp field.
+  double rel_time_min = std::numeric_limits<double>::max();
+  double rel_time_max = std::numeric_limits<double>::lowest();
+  for (int i = 0; i < plsize; i++)
+  {
+    const uint8_t* point_ptr = data_ptr + static_cast<size_t>(i) * point_step;
+    if (!is_lidar_point_valid(point_ptr, offsets))
+      continue;
+    if (!has_point_time)
+      break;
+
+    double rel_value = read_lidar_point_time(point_ptr, offsets);
+    if (absolute_point_time)
+      rel_value -= scan_time_base;
+
+    rel_time_min = std::min(rel_time_min, rel_value);
+    rel_time_max = std::max(rel_time_max, rel_value);
+  }
+
+  const bool azimuth_encoded_time =
+      has_point_time && absolute_point_time && (rel_time_max - rel_time_min > 1.0);
+  const double rel_time_span = rel_time_max - rel_time_min;
+
+  if (has_point_time && rel_time_max > 0)
   {
     given_offset_time = true;
   }
   else
   {
     given_offset_time = false;
-    double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
+    const uint8_t* first_point_ptr = data_ptr;
+    const float first_x = read_lidar_float(first_point_ptr, offsets.x);
+    const float first_y = read_lidar_float(first_point_ptr, offsets.y);
+    double yaw_first = atan2(first_y, first_x) * 57.29578;
     double yaw_end = yaw_first;
-    int layer_first = pl_orig.points[0].ring;
-    for (uint i = plsize - 1; i > 0; i--)
+    const int layer_first = read_lidar_ring(first_point_ptr, offsets.ring);
+    for (int i = plsize - 1; i > 0; i--)
     {
-      if (pl_orig.points[i].ring == layer_first)
+      const uint8_t* point_ptr = data_ptr + static_cast<size_t>(i) * point_step;
+      if (read_lidar_ring(point_ptr, offsets.ring) == layer_first)
       {
-        yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
+        const float px = read_lidar_float(point_ptr, offsets.x);
+        const float py = read_lidar_float(point_ptr, offsets.y);
+        yaw_end = atan2(py, px) * 57.29578;
         break;
       }
     }
   }
+
+  auto get_point_time = [&](const uint8_t* point_ptr) {
+    float point_time = read_lidar_point_time(point_ptr, offsets);
+    if (absolute_point_time)
+      point_time -= static_cast<float>(scan_time_base);
+
+    if (azimuth_encoded_time && rel_time_span > 1e-6)
+    {
+      point_time = static_cast<float>((point_time - static_cast<float>(rel_time_min)) /
+                                      static_cast<float>(rel_time_span) / SCAN_RATE);
+    }
+    return point_time;
+  };
 
   if (feature_enabled)
   {
@@ -344,25 +467,31 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
 
     for (int i = 0; i < plsize; i++)
     {
+      const uint8_t* point_ptr = data_ptr + static_cast<size_t>(i) * point_step;
+      if (!is_lidar_point_valid(point_ptr, offsets))
+        continue;
+
       PointType added_pt;
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;
-      int layer = pl_orig.points[i].ring;
+      const int layer = read_lidar_ring(point_ptr, offsets.ring);
       if (layer >= N_SCANS)
         continue;
-      added_pt.x = pl_orig.points[i].x;
-      added_pt.y = pl_orig.points[i].y;
-      added_pt.z = pl_orig.points[i].z;
-      added_pt.intensity = pl_orig.points[i].intensity;
-      added_pt.curvature = pl_orig.points[i].time * time_unit_scale;  // units: ms
+      added_pt.x = read_lidar_float(point_ptr, offsets.x);
+      added_pt.y = read_lidar_float(point_ptr, offsets.y);
+      added_pt.z = read_lidar_float(point_ptr, offsets.z);
+      if (offsets.intensity >= 0)
+        added_pt.intensity = read_lidar_float(point_ptr, offsets.intensity);
+      else
+        added_pt.intensity = 0.f;
+      added_pt.curvature = get_point_time(point_ptr) * time_unit_scale;  // units: ms
 
       if (!given_offset_time)
       {
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
         if (is_first[layer])
         {
-          // printf("layer: %d; is first: %d", layer, is_first[layer]);
           yaw_fp[layer] = yaw_angle;
           is_first[layer] = false;
           added_pt.curvature = 0.0;
@@ -416,27 +545,30 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   {
     for (int i = 0; i < plsize; i++)
     {
-      PointType added_pt;
-      // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
+      const uint8_t* point_ptr = data_ptr + static_cast<size_t>(i) * point_step;
+      if (!is_lidar_point_valid(point_ptr, offsets))
+        continue;
 
+      PointType added_pt;
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;
-      added_pt.x = pl_orig.points[i].x;
-      added_pt.y = pl_orig.points[i].y;
-      added_pt.z = pl_orig.points[i].z;
-      added_pt.intensity = pl_orig.points[i].intensity;
-      added_pt.curvature =
-          pl_orig.points[i].time * time_unit_scale;  // curvature unit: ms // cout<<added_pt.curvature<<endl;
+      added_pt.x = read_lidar_float(point_ptr, offsets.x);
+      added_pt.y = read_lidar_float(point_ptr, offsets.y);
+      added_pt.z = read_lidar_float(point_ptr, offsets.z);
+      if (offsets.intensity >= 0)
+        added_pt.intensity = read_lidar_float(point_ptr, offsets.intensity);
+      else
+        added_pt.intensity = 0.f;
+      added_pt.curvature = get_point_time(point_ptr) * time_unit_scale;  // curvature unit: ms
 
       if (!given_offset_time)
       {
-        int layer = pl_orig.points[i].ring;
+        const int layer = read_lidar_ring(point_ptr, offsets.ring);
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
         if (is_first[layer])
         {
-          // printf("layer: %d; is first: %d", layer, is_first[layer]);
           yaw_fp[layer] = yaw_angle;
           is_first[layer] = false;
           added_pt.curvature = 0.0;
@@ -445,7 +577,6 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
           continue;
         }
 
-        // compute offset time
         if (yaw_angle <= yaw_fp[layer])
         {
           added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
